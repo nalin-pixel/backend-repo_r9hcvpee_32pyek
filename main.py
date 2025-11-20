@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Betting Signals API")
+app = FastAPI(title="Flamez Signals API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,12 +33,12 @@ class SignalsResponse(BaseModel):
 
 @app.get("/", tags=["health"])
 def read_root():
-    return {"message": "Betting Signals Backend running"}
+    return {"message": "Flamez Signals Backend running"}
 
 
 @app.get("/api/hello", tags=["health"])
 def hello():
-    return {"message": "Hello from the backend API!"}
+    return {"message": "Hello from the Flamez Signals API!"}
 
 
 @app.get("/test", tags=["health"])
