@@ -31,6 +31,12 @@ class SignalsResponse(BaseModel):
     betting_signals: List[BettingSignal]
 
 
+class SegmentedSignalsResponse(BaseModel):
+    date: str
+    free: List[BettingSignal]
+    vip: List[BettingSignal]
+
+
 @app.get("/", tags=["health"])
 def read_root():
     return {"message": "Flamez Signals Backend running"}
@@ -91,7 +97,7 @@ TEAMS = {
 PICKS = ["1X", "12", "X2", "GG", "NG", "Over 2.5", "Under 2.5"]
 
 
-def make_signal(league: str) -> BettingSignal:
+def make_signal(league: str, tier: Literal["free", "vip"] = "free") -> BettingSignal:
     teams = TEAMS[league]
     home = choice(teams)
     away = choice([t for t in teams if t != home])
@@ -109,12 +115,16 @@ def make_signal(league: str) -> BettingSignal:
     }[prediction]
     confidence = randint(base[0], base[1])
 
+    # VIP tier skews slightly higher confidence
+    if tier == "vip":
+        confidence = min(90, confidence + randint(3, 7))
+
     risk = "Low" if confidence >= 72 else ("Medium" if confidence >= 60 else "High")
 
     # Small nudge: derby-like names increase GG/Over likelihood
     if ("Real" in home and "Real" in away) or ("AC" in home and "Inter" in away):
         if prediction in ["GG", "Over 2.5"]:
-            confidence = min(80, confidence + 2)
+            confidence = min(92 if tier == "vip" else 80, confidence + 2)
             risk = "Low" if confidence >= 72 else risk
 
     return BettingSignal(
@@ -140,11 +150,38 @@ def get_predictions(count: int = 12):
     i = 0
     while len(signals) < count:
         league = leagues[i % len(leagues)]
-        signals.append(make_signal(league))
+        signals.append(make_signal(league, tier="free"))
         i += 1
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
     return SignalsResponse(date=today, betting_signals=signals)
+
+
+@app.get("/api/predictions/segmented", response_model=SegmentedSignalsResponse, tags=["predictions"])
+def get_segmented_predictions(free_count: int = 12, vip_count: int = 6):
+    """Return separate sections for Free and VIP tips.
+    Free: 10-15 items (clamped). VIP: 3-10 items (clamped) with slightly higher confidence.
+    """
+    free_count = max(10, min(15, free_count))
+    vip_count = max(3, min(10, vip_count))
+
+    leagues = list(TEAMS.keys())
+
+    def build(count: int, tier: Literal["free", "vip"]) -> List[BettingSignal]:
+        out: List[BettingSignal] = []
+        i = 0
+        while len(out) < count:
+            league = leagues[i % len(leagues)]
+            out.append(make_signal(league, tier=tier))
+            i += 1
+        return out
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    return SegmentedSignalsResponse(
+        date=today,
+        free=build(free_count, "free"),
+        vip=build(vip_count, "vip"),
+    )
 
 
 if __name__ == "__main__":
