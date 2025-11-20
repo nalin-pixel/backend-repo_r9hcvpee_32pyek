@@ -1,11 +1,25 @@
 import os
-from datetime import datetime
+import hmac
+import json
+import base64
+from hashlib import sha256
+from datetime import datetime, timedelta, timezone
 from random import choice, randint
-from typing import List, Literal
+from typing import List, Literal, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+
+# Optional Stripe import (used if STRIPE_SECRET_KEY is configured)
+try:
+    import stripe  # type: ignore
+except Exception:  # pragma: no cover
+    stripe = None
+
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ISSUER = "flamez-signals"
 
 app = FastAPI(title="Flamez Signals API")
 
@@ -16,6 +30,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+security = HTTPBearer(auto_error=False)
 
 
 class BettingSignal(BaseModel):
@@ -35,6 +51,11 @@ class SegmentedSignalsResponse(BaseModel):
     date: str
     free: List[BettingSignal]
     vip: List[BettingSignal]
+
+
+class VIPToken(BaseModel):
+    token: str
+    expires_at: str
 
 
 @app.get("/", tags=["health"])
@@ -64,6 +85,56 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
 
     return response
+
+
+# -------- Minimal signed token utilities (no external deps) -------- #
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = '=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _sign(payload_b64: str) -> str:
+    digest = hmac.new(JWT_SECRET.encode(), payload_b64.encode(), sha256).digest()
+    return _b64url(digest)
+
+
+def create_vip_token(days: int = 7) -> VIPToken:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(days=days)
+    payload = {
+        "iss": JWT_ISSUER,
+        "sub": "vip",
+        "scope": "vip:read",
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+    sig_b64 = _sign(payload_b64)
+    token = f"{payload_b64}.{sig_b64}"
+    return VIPToken(token=token, expires_at=exp.isoformat())
+
+
+def verify_vip_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> bool:
+    if not credentials or credentials.scheme.lower() != "bearer":
+        return False
+    token = credentials.credentials
+    try:
+        payload_b64, sig = token.split(".", 1)
+        if not hmac.compare_digest(sig, _sign(payload_b64)):
+            return False
+        payload = json.loads(_b64url_decode(payload_b64))
+        if payload.get("iss") != JWT_ISSUER or payload.get("scope") != "vip:read":
+            return False
+        if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
+            return False
+        return True
+    except Exception:
+        return False
 
 
 # -------- Betting Signals Generator (no external APIs) -------- #
@@ -158,9 +229,12 @@ def get_predictions(count: int = 6):
 
 
 @app.get("/api/predictions/segmented", response_model=SegmentedSignalsResponse, tags=["predictions"])
-def get_segmented_predictions(free_count: int = 6, vip_count: int = 6):
+def get_segmented_predictions(request: Request, free_count: int = 6, vip_count: int = 6, vip_ok: bool = Depends(verify_vip_token)):
     """Return separate sections for Free and VIP tips.
     Free: fixed at 6 items. VIP: 3-10 items (clamped) with slightly higher confidence.
+
+    VIP tips are only returned when a valid Bearer token is supplied.
+    Otherwise, VIP list is returned empty.
     """
     # Enforce exactly 6 free tips
     free_count = 6
@@ -178,11 +252,77 @@ def get_segmented_predictions(free_count: int = 6, vip_count: int = 6):
         return out
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    free_list = build(free_count, "free")
+    vip_list = build(vip_count, "vip") if vip_ok else []
+
     return SegmentedSignalsResponse(
         date=today,
-        free=build(free_count, "free"),
-        vip=build(vip_count, "vip"),
+        free=free_list,
+        vip=vip_list,
     )
+
+
+# -------- VIP Auth & Payments -------- #
+@app.post("/api/vip/demo-activate", response_model=VIPToken, tags=["auth"])
+def demo_activate_vip():
+    """Issue a demo VIP token (no payment) valid for 7 days.
+    Useful for development and preview environments.
+    """
+    return create_vip_token(days=7)
+
+
+@app.post("/api/payments/checkout", tags=["payments"])
+async def create_checkout_session(request: Request):
+    """Create a Stripe Checkout Session and return its URL.
+    Requires STRIPE_SECRET_KEY and STRIPE_PRICE_ID to be set. If not configured,
+    returns 400 with guidance.
+    """
+    secret = os.getenv("STRIPE_SECRET_KEY")
+    price_id = os.getenv("STRIPE_PRICE_ID")
+    success_url = os.getenv("STRIPE_SUCCESS_URL") or f"{request.headers.get('origin','') or 'http://localhost:3000'}/?checkout=success"
+    cancel_url = os.getenv("STRIPE_CANCEL_URL") or f"{request.headers.get('origin','') or 'http://localhost:3000'}/?checkout=cancel"
+
+    if not secret or not price_id or stripe is None:
+        raise HTTPException(status_code=400, detail="Stripe not configured. Use demo activation or set STRIPE_SECRET_KEY and STRIPE_PRICE_ID.")
+
+    stripe.api_key = secret
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url + "&session_id={CHECKOUT_SESSION_ID}",
+            cancel_url=cancel_url,
+            allow_promotion_codes=True,
+        )
+        return {"url": session.url}
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Optional webhook stub (records events in logs)
+@app.post("/api/webhook/stripe", tags=["payments"])
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+    if stripe is None or not endpoint_secret:
+        # Accept silently in dev environments
+        return {"received": True, "note": "Stripe not configured"}
+
+    try:
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=endpoint_secret)
+    except Exception as e:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
+
+    # Handle completed checkout by issuing a token (stateless demo)
+    if event.get("type") == "checkout.session.completed":
+        # In a real app, link customer to your user and persist entitlement
+        # Here, nothing to persist; clients should rely on success redirect to claim
+        pass
+
+    return {"received": True}
 
 
 if __name__ == "__main__":
