@@ -137,11 +137,11 @@ def make_signal(league: str, tier: Literal["free", "vip"] = "free") -> BettingSi
 
 
 @app.get("/api/predictions", response_model=SignalsResponse, tags=["predictions"])
-def get_predictions(count: int = 12):
-    """Generate 10-15 balanced betting signals for today's date.
-    Use `count` query param to adjust (defaults to 12, clamped to [10,15]).
+def get_predictions(count: int = 6):
+    """Generate exactly 6 betting signals for today's date.
+    Any provided `count` is ignored to enforce the 6-item limit.
     """
-    count = max(10, min(15, count))
+    count = 6  # enforce fixed number of free tips
 
     leagues = list(TEAMS.keys())
     signals: List[BettingSignal] = []
@@ -158,11 +158,12 @@ def get_predictions(count: int = 12):
 
 
 @app.get("/api/predictions/segmented", response_model=SegmentedSignalsResponse, tags=["predictions"])
-def get_segmented_predictions(free_count: int = 12, vip_count: int = 6):
+def get_segmented_predictions(free_count: int = 6, vip_count: int = 6):
     """Return separate sections for Free and VIP tips.
-    Free: 10-15 items (clamped). VIP: 3-10 items (clamped) with slightly higher confidence.
+    Free: fixed at 6 items. VIP: 3-10 items (clamped) with slightly higher confidence.
     """
-    free_count = max(10, min(15, free_count))
+    # Enforce exactly 6 free tips
+    free_count = 6
     vip_count = max(3, min(10, vip_count))
 
     leagues = list(TEAMS.keys())
